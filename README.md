@@ -1,5 +1,5 @@
 # Remotely-sensed-3D-ecosystem-structure-indicators-to-explain-biodiversity-distribution
-# Code for reproducible SDM analyses (Ecological Informatics submission)
+# Code for reproducible SDM analyses 
 
 This repository contains the R scripts used in the manuscript.
 
