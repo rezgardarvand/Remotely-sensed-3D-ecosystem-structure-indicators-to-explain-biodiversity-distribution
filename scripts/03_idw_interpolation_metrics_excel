@@ -1,0 +1,112 @@
+library(data.table)
+library(dplyr)
+library(terra)
+library(readxl)
+
+lon_col <- "lon_lowestmode"
+lat_col <- "lat_lowestmode"
+
+excel_path <- "data/processed/metrics_for_interpolation.xlsx"
+excel_sheet <- 1
+
+north_shp <- "data/boundary/north.shp"
+
+out_dir <- "outputs/interpolation"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+res_list <- 500
+
+p_power    <- 2
+maxdist_m  <- 7000
+n_test_max <- 20000
+set.seed(1)
+
+df <- as.data.table(readxl::read_excel(excel_path, sheet = excel_sheet))
+vars <- setdiff(names(df), c(lon_col, lat_col))
+
+pts_ll <- vect(df[, .(x = get(lon_col), y = get(lat_col))],
+               geom = c("x","y"), crs = "EPSG:4326")
+pts_utm <- project(pts_ll, "EPSG:32639")
+
+north_ll <- vect(north_shp)
+if (is.na(crs(north_ll))) crs(north_ll) <- "EPSG:4326"
+north_utm <- project(north_ll, "EPSG:32639")
+
+e_ll <- ext(48.56974, 56.31356, 35.76376, 38.45335)
+tmp_ll  <- rast(e_ll, crs="EPSG:4326", res=0.05)
+tmp_utm <- project(tmp_ll, "EPSG:32639")
+e_utm   <- ext(tmp_utm)
+
+run_idw <- function(varname, res_m) {
+
+  v <- as.numeric(df[[varname]])
+  ok <- which(!is.na(v) & is.finite(v))
+
+  if (length(ok) < 30) {
+    return(list(
+      raster = NULL,
+      stats = data.frame(variable = varname, res_m = res_m,
+                         rmse = NA, rmse_percent = NA,
+                         n_total = length(ok),
+                         stringsAsFactors = FALSE)
+    ))
+  }
+
+  pts <- pts_utm[ok, ]
+  pts$z <- v[ok]
+
+  grid <- rast(e_utm, crs="EPSG:32639", res=res_m)
+  mask_grid <- rasterize(north_utm, grid)
+
+  n_all  <- nrow(pts)
+  n_test <- min(n_test_max, max(1, floor(0.2 * n_all)))
+  s <- sample(seq_len(n_all), n_test)
+
+  train <- pts[-s, ]
+  test  <- pts[s, ]
+
+  iw <- interpIDW(mask_grid, train, "z",
+                  p = p_power, maxdist_m, smooth = 0)
+  iw <- mask(iw, mask_grid)
+  names(iw) <- varname
+
+  ex <- extract(iw, test, ID = FALSE)[,1]
+  okp <- !is.na(ex)
+
+  rmse <- sqrt(mean((test$z[okp] - ex[okp])^2))
+  rng  <- range(pts$z, na.rm = TRUE)
+  rmse_p <- (rmse / diff(rng)) * 100
+
+  stats <- data.frame(
+    variable = varname,
+    res_m = res_m,
+    n_total = n_all,
+    n_train = nrow(train),
+    n_test  = nrow(test),
+    rmse = rmse,
+    rmse_percent = rmse_p,
+    na_pred_test = sum(!okp),
+    stringsAsFactors = FALSE
+  )
+
+  list(raster = iw, stats = stats)
+}
+
+stats_all <- list()
+
+for (v in vars) {
+  res_obj <- run_idw(v, res_list)
+  stats_all[[length(stats_all) + 1]] <- res_obj$stats
+
+  if (!is.null(res_obj$raster)) {
+    writeRaster(
+      res_obj$raster,
+      file.path(out_dir, paste0("idw_", v, "_500m.tif")),
+      overwrite = TRUE
+    )
+  }
+}
+
+rmse_table <- bind_rows(stats_all)
+fwrite(rmse_table, file.path(out_dir, "rmse_summary_500m.csv"))
+rmse_table
