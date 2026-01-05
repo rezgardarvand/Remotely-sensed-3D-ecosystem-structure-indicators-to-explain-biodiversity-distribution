@@ -1,0 +1,25 @@
+# Outputs
+outputs/
+
+# Data folders (stored on Zenodo)
+data/processed/
+data/predictors/
+
+# Raster and large data files
+*.tif
+*.tiff
+*.grd
+*.nc
+
+# Tables
+*.csv
+*.xlsx
+
+# R specific
+.Rhistory
+.RData
+.Rproj.user/
+
+# OS files
+.DS_Store
+Thumbs.db
