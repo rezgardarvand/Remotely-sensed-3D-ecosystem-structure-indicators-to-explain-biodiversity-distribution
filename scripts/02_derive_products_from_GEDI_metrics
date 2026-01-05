@@ -1,0 +1,217 @@
+# scripts/02_derive_products_from_metrics.R
+
+library(data.table)
+library(dplyr)
+library(sf)
+library(elsa)
+
+# optional parts (only needed if you want rasters / IDW later)
+suppressWarnings({
+  if (requireNamespace("terra", quietly = TRUE)) library(terra)
+  if (requireNamespace("e1071", quietly = TRUE)) library(e1071)
+})
+
+# -------------------------
+# Settings (edit paths)
+# -------------------------
+# Inputs (CSV extracted/filtered from previous step)
+pavd_csv <- "data/processed/GEDI_L2B_PAVD_profile_filtered.csv"
+pai_csv  <- "data/processed/GEDI_L2B_PAI_profile_filtered.csv"
+l2a_csv  <- "data/processed/GEDI_L2A_metrics_filtered.csv"
+
+# Study area boundary (optional, only for raster interpolation)
+north_shp <- "data/boundary/north.shp"   # if you have it
+
+# Outputs
+out_dir <- "outputs/products"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------
+# 1) Entropy from PAVD (1 km voxels)
+# -------------------------
+pavd_dt <- fread(pavd_csv)
+
+lon_col <- "lon_lowestmode"
+lat_col <- "lat_lowestmode"
+
+# choose PAVD columns (keep similar to your original)
+pavd_cols <- grep("^pavd", names(pavd_dt), value = TRUE)
+if (length(pavd_cols) == 0) pavd_cols <- names(pavd_dt)[-(1:2)]
+# you used first 10 columns (0-50m if 5m bins); keep same logic:
+pavd_cols <- pavd_cols[1:min(10, length(pavd_cols))]
+
+utm_epsg  <- 32639
+grid_size <- 1000
+min_vals  <- 1
+
+# breaks (same as your code)
+s <- c(0.1,0.2,0.3,0.4,0.5,0.6,0.09,0.08,0.07,0.06,0.05,0.04,0.03,0.02,
+       0.015,0.0125,0.01,0.008,0.007,0.006,0.005,0.004,0.003,0.002,
+       0.0015,0.00125,0.001)
+s[1] <- -1e-5
+s <- sort(unique(s))
+K <- length(s)
+
+gedi_dt <- as.data.table(pavd_dt[, c(lon_col, lat_col, pavd_cols), with = FALSE])
+gedi_dt <- gedi_dt[!is.na(get(lon_col)) & !is.na(get(lat_col))]
+
+gedi_sf <- st_as_sf(gedi_dt, coords = c(lon_col, lat_col), crs = 4326, remove = FALSE)
+gedi_sf_utm <- st_transform(gedi_sf, crs = utm_epsg)
+xy <- st_coordinates(gedi_sf_utm)
+gedi_dt[, x := xy[,1]]
+gedi_dt[, y := xy[,2]]
+
+gedi_dt[, grid_x := floor(x / grid_size)]
+gedi_dt[, grid_y := floor(y / grid_size)]
+gedi_dt[, grid_id := paste0(grid_x, "_", grid_y)]
+gedi_dt[, x_center := (grid_x + 0.5) * grid_size]
+gedi_dt[, y_center := (grid_y + 0.5) * grid_size]
+
+long <- melt(
+  gedi_dt,
+  id.vars = c("grid_id","x_center","y_center"),
+  measure.vars = pavd_cols,
+  value.name = "val"
+)
+long[, val := as.numeric(val)]
+long <- long[is.finite(val)]
+
+long[, cls := elsa::categorize(val, s)]
+n_by_grid <- long[, .N, by = grid_id]
+setnames(n_by_grid, "N", "n_vals")
+
+cnt <- long[, .N, by = .(grid_id, cls)]
+cnt[, p := N / sum(N), by = grid_id]
+
+entropy_dt <- cnt[, .(
+  entropy = {
+    H <- -sum(p * log(p))
+    H / log(K)
+  }
+), by = grid_id]
+
+entropy_dt <- merge(entropy_dt, n_by_grid, by="grid_id", all.x=TRUE)
+entropy_dt[n_vals < min_vals, entropy := NA_real_]
+
+centers <- unique(gedi_dt[, .(grid_id, x_center, y_center)])
+entropy_dt <- merge(entropy_dt, centers, by="grid_id", all.x=TRUE)
+
+grid_sf <- st_as_sf(entropy_dt, coords = c("x_center","y_center"), crs = utm_epsg, remove = FALSE)
+grid_ll <- st_transform(grid_sf, 4326)
+ll <- st_coordinates(grid_ll)
+entropy_dt[, longitude := ll[,1]]
+entropy_dt[, latitude  := ll[,2]]
+
+fwrite(entropy_dt, file.path(out_dir, "pavd_entropy_1km.csv"))
+
+# -------------------------
+# 2) RH regression params + canopy ratio (CR)
+# -------------------------
+l2a_dt <- fread(l2a_csv)
+
+# try to detect RH columns
+rh_cols <- grep("^rh", names(l2a_dt), value = TRUE)
+if (length(rh_cols) == 0) {
+  # fallback to your original indexing (edit if needed)
+  rh_cols <- names(l2a_dt)[13:113]
+}
+rh <- as.matrix(l2a_dt[, ..rh_cols])
+
+# CR based on RH98 and RH25 (edit column names if needed)
+if (all(c("rh98","rh25") %in% names(l2a_dt))) {
+  l2a_dt[, CR := (rh98 - rh25) / rh98]
+}
+
+calculate_slope_intercept <- function(x) {
+  t <- 1:length(x)
+  m <- lm(x ~ t)
+  c(
+    slope     = coef(m)[2],
+    intercept = coef(m)[1],
+    residuals = var(residuals(m))
+  )
+}
+
+reg <- t(apply(rh, 1, calculate_slope_intercept))
+reg_dt <- as.data.table(reg)
+reg_dt[, lat_lowestmode := l2a_dt$lat_lowestmode]
+reg_dt[, lon_lowestmode := l2a_dt$lon_lowestmode]
+
+fwrite(reg_dt, file.path(out_dir, "rh_regression_params.csv"))
+
+# -------------------------
+# 3) Dispersion indices from PAI profile (std, CV, kurtosis, skewness)
+# -------------------------
+pai_dt <- fread(pai_csv)
+
+pai_cols <- grep("^pai", names(pai_dt), value = TRUE)
+if (length(pai_cols) == 0) {
+  # fallback (edit if needed)
+  pai_cols <- names(pai_dt)[13:22]
+}
+PAI <- as.matrix(pai_dt[, ..pai_cols])
+
+if (!requireNamespace("e1071", quietly = TRUE)) {
+  stop("Package 'e1071' is required for kurtosis/skewness. Install it: install.packages('e1071')")
+}
+
+calculate_metrics <- function(values) {
+  std_dev <- sd(values, na.rm = TRUE)
+  mean_val <- mean(values, na.rm = TRUE)
+  cv <- ifelse(is.na(mean_val) || mean_val == 0, NA_real_, (std_dev / mean_val) * 100)
+  c(
+    std_val  = std_dev,
+    CV       = cv,
+    Kurtosis = e1071::kurtosis(values, na.rm = TRUE),
+    Skewness = e1071::skewness(values, na.rm = TRUE)
+  )
+}
+
+disp <- t(apply(PAI, 1, calculate_metrics))
+disp_dt <- as.data.table(disp)
+disp_dt[, lat_lowestmode := pai_dt$lat_lowestmode]
+disp_dt[, lon_lowestmode := pai_dt$lon_lowestmode]
+
+fwrite(disp_dt, file.path(out_dir, "pai_dispersion_indices.csv"))
+
+# -------------------------
+# 4) (Optional) IDW interpolation to rasters (only if you want)
+# -------------------------
+# Needs: terra + north.shp. If you don't want rasters now, ignore this part.
+# This is a compact loop version of your repeated code.
+
+if (file.exists(north_shp) && requireNamespace("terra", quietly = TRUE)) {
+
+  north <- terra::vect(north_shp)
+  north <- terra::aggregate(north, fun = union)
+  north <- terra::project(north, "EPSG:4326")
+
+  # edit extent/res if needed
+  e <- terra::ext(48.56974, 56.31356, 35.76376, 38.45335)
+  template <- terra::rast(e, crs="EPSG:4326", resolution=0.005)
+
+  make_idw <- function(df, value_col, out_name, p=0.07, smooth=0, test_n=10000) {
+    v <- terra::vect(df, geom=c("x","y"), crs="EPSG:4326")
+    rmask <- terra::rasterize(north, template)
+    s <- sample(nrow(v), min(test_n, nrow(v)))
+    train <- v[-s,]
+    test  <- v[s,]
+    r_idw <- terra::interpIDW(rmask, train, value_col, p, smooth=smooth)
+    r_idw <- terra::mask(r_idw, rmask)
+    terra::writeRaster(r_idw, file.path(out_dir, paste0(out_name, ".tif")), overwrite=TRUE)
+  }
+
+  # Example: interpolate elevation from PAI csv (if present)
+  if (all(c("elev_lowestmode","elev_highestreturn","lon_lowestmode","lat_lowestmode") %in% names(pai_dt))) {
+    elev_df <- data.frame(
+      x = pai_dt$lon_lowestmode,
+      y = pai_dt$lat_lowestmode,
+      elev_lowestmode = pai_dt$elev_lowestmode,
+      elev_highestreturn = pai_dt$elev_highestreturn
+    )
+    make_idw(elev_df, "elev_lowestmode", "iw_elev_lowestmode")
+    make_idw(elev_df, "elev_highestreturn", "iw_elev_highestreturn")
+  }
+}
+
+message("Done. Outputs are in: ", out_dir)
