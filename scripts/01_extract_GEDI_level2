@@ -1,0 +1,150 @@
+# scripts/01_extract_gedi_level2.R
+# ------------------------------------------------------------
+# Purpose:
+#   Extract GEDI Level 2A and Level 2B metrics from local .h5 granules,
+#   apply common quality filters, and write reproducible CSV outputs.
+#
+# Notes:
+#   - This script DOES NOT include any GEDI data files.
+#   - GEDI granules are publicly available from NASA LP DAAC / Earthdata.
+#   - Place your downloaded .h5 files into:
+#       data/raw/gedi_l2a_h5/
+#       data/raw/gedi_l2b_h5/
+#
+# Outputs:
+#   outputs/gedi_tables/
+#     - GEDI_L2A_metrics_filtered.csv
+#     - GEDI_L2B_BVPM_filtered.csv
+#     - GEDI_L2B_PAI_profile_filtered.csv
+#     - GEDI_L2B_PAVD_profile_filtered.csv
+#     - sessionInfo.txt
+#     - run_log.txt
+#
+# Reproducibility:
+#   - Saves sessionInfo() and a run log.
+# ------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  library(rGEDI)
+  library(data.table)
+  library(dplyr)
+})
+
+# --------- User settings (EDIT IF NEEDED) ----------
+# Put your downloaded GEDI .h5 files here:
+l2a_dir <- "data/raw/gedi_l2a_h5"
+l2b_dir <- "data/raw/gedi_l2b_h5"
+
+# Output directory:
+out_dir <- "outputs/gedi_tables"
+# --------------------------------------------------
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+log_file <- file.path(out_dir, "run_log.txt")
+cat("GEDI extraction started: ", as.character(Sys.time()), "\n", file = log_file)
+
+safe_read <- function(files, read_fun) {
+  res <- vector("list", length(files))
+  for (i in seq_along(files)) {
+    f <- files[i]
+    cat(sprintf("[%d/%d] Reading: %s\n", i, length(files), basename(f)),
+        file = log_file, append = TRUE)
+    res[[i]] <- tryCatch(
+      read_fun(f),
+      error = function(e) {
+        cat("ERROR reading file: ", f, "\n",
+            conditionMessage(e), "\n",
+            file = log_file, append = TRUE)
+        return(NULL)
+      }
+    )
+  }
+  Filter(Negate(is.null), res)
+}
+
+# =========================
+# Level 2A
+# =========================
+l2a_files <- list.files(l2a_dir, pattern = "\\.h5$", full.names = TRUE)
+if (length(l2a_files) == 0) {
+  stop("No .h5 files found in l2a_dir: ", l2a_dir,
+       "\nPlace GEDI L2A .h5 granules in: ", l2a_dir)
+}
+
+all_h5_2a <- safe_read(l2a_files, readLevel2A)
+
+metrics_2a <- lapply(all_h5_2a, function(x) {
+  m <- getLevel2AM(level2a = x)
+
+  # Common QA filters (adjust if your study used different thresholds):
+  dplyr::filter(
+    m,
+    quality_flag != 0,
+    sensitivity > 0.95,
+    degrade_flag != 1
+  )
+})
+
+all_metrics_2a <- data.table::rbindlist(metrics_2a, fill = TRUE)
+out_2a <- file.path(out_dir, "GEDI_L2A_metrics_filtered.csv")
+data.table::fwrite(all_metrics_2a, out_2a)
+
+cat("Wrote: ", out_2a, "\n", file = log_file, append = TRUE)
+
+# =========================
+# Level 2B
+# =========================
+l2b_files <- list.files(l2b_dir, pattern = "\\.h5$", full.names = TRUE)
+if (length(l2b_files) == 0) {
+  stop("No .h5 files found in l2b_dir: ", l2b_dir,
+       "\nPlace GEDI L2B .h5 granules in: ", l2b_dir)
+}
+
+all_h5_2b <- safe_read(l2b_files, readLevel2B)
+
+# ---- 2B: BVPM (biophysical variables) ----
+metrics_bvpm <- lapply(all_h5_2b, function(x) {
+  m <- getLevel2BVPM(level2b = x)
+
+  dplyr::filter(
+    m,
+    l2b_quality_flag != 0,
+    sensitivity > 0.95,
+    algorithmrun_flag == 1
+  )
+})
+
+all_bvpm <- data.table::rbindlist(metrics_bvpm, fill = TRUE)
+out_bvpm <- file.path(out_dir, "GEDI_L2B_BVPM_filtered.csv")
+data.table::fwrite(all_bvpm, out_bvpm)
+cat("Wrote: ", out_bvpm, "\n", file = log_file, append = TRUE)
+
+# ---- 2B: PAI profile ----
+metrics_pai <- lapply(all_h5_2b, function(x) {
+  m <- getLevel2BPAIProfile(level2b = x)
+  dplyr::filter(m, l2b_quality_flag != 0, algorithmrun_flag == 1)
+})
+
+all_pai <- data.table::rbindlist(metrics_pai, fill = TRUE)
+out_pai <- file.path(out_dir, "GEDI_L2B_PAI_profile_filtered.csv")
+data.table::fwrite(all_pai, out_pai)
+cat("Wrote: ", out_pai, "\n", file = log_file, append = TRUE)
+
+# ---- 2B: PAVD profile ----
+metrics_pavd <- lapply(all_h5_2b, function(x) {
+  m <- getLevel2BPAVDProfile(level2b = x)
+  dplyr::filter(m, l2b_quality_flag != 0, algorithmrun_flag == 1)
+})
+
+all_pavd <- data.table::rbindlist(metrics_pavd, fill = TRUE)
+out_pavd <- file.path(out_dir, "GEDI_L2B_PAVD_profile_filtered.csv")
+data.table::fwrite(all_pavd, out_pavd)
+cat("Wrote: ", out_pavd, "\n", file = log_file, append = TRUE)
+
+# ---- Save session info for reproducibility ----
+sess <- capture.output(sessionInfo())
+writeLines(sess, con = file.path(out_dir, "sessionInfo.txt"))
+
+cat("GEDI extraction finished: ", as.character(Sys.time()), "\n", file = log_file, append = TRUE)
+message("Done. Outputs saved in: ", out_dir)
