@@ -9,29 +9,21 @@ library(data.table)
 
 data_csv <- "data/processed/Cupressus_final_data_for_SDM.csv"
 
-# ---- 1000m inputs ----
-GEDI_DIR   <- "data/predictors/GEDI_1000m"   # <-- مسیر پوشه GEDI با رزولوشن 1000m
-CHELSA_DIR <- "data/predictors/CHELSA_1000m" # <-- مسیر پوشه CHELSA با رزولوشن 1000m
+GEDI_DIR   <- "data/predictors/GEDI"
+CHELSA_DIR <- "data/predictors/CHELSA"
 
-# ---- outputs ----
-OUT_ROOT <- "outputs/sdm_1000m"
+OUT_ROOT <- "outputs/sdm"
 dir.create(OUT_ROOT, recursive = TRUE, showWarnings = FALSE)
 
-RES_M   <- 1000
-RES_TAG <- paste0(RES_M, "m")   # "1000m"
-
-# ---- load data ----
 data <- fread(data_csv, check.names = FALSE)
 colnames(data) <- gsub(pattern = "\\.", replacement = " ", x = colnames(data))
 
 coord_cols <- c("longitude", "latitude")
 sp_cols <- setdiff(names(data), coord_cols)
 
-# keep species with >30 presences
 keep_sp <- sp_cols[colSums(as.matrix(data[, ..sp_cols]) > 0, na.rm = TRUE) > 30]
 data <- data[, c(coord_cols, keep_sp), with = FALSE]
 
-# ---- LightGBM params ----
 params <- list(
   objective = "xentropy",
   learning_rate = 0.1,
@@ -52,37 +44,29 @@ load_stack <- function(dir_path) {
   rast(f)
 }
 
-# ---- predictors (1000m) ----
-gedi_1000 <- load_stack(GEDI_DIR)
-chelsa_1000 <- load_stack(CHELSA_DIR)
+gedi <- load_stack(GEDI_DIR)
+chelsa <- load_stack(CHELSA_DIR)
 
-# Ensure same CRS
-if (!same.crs(chelsa_1000, gedi_1000)) chelsa_1000 <- project(chelsa_1000, crs(gedi_1000))
-
-# Align CHELSA grid to GEDI template (keeps 1000m if GEDI is 1000m)
-chelsa_1000_aligned <- resample(chelsa_1000, gedi_1000[[1]], method = "bilinear")
-
-# Optional sanity check: should be ~1000m
-# print(res(gedi_1000[[1]]))
-# print(res(chelsa_1000_aligned[[1]]))
+if (!same.crs(chelsa, gedi)) chelsa <- project(chelsa, crs(gedi))
 
 scenarios <- list(
-  GEDI = gedi_1000,
-  CHELSA = chelsa_1000_aligned,
-  COMBINATION = c(gedi_1000, chelsa_1000_aligned)
+  GEDI = gedi,
+  CHELSA = chelsa,
+  COMBINATION = c(gedi, chelsa)
 )
 
 spp_long <- data %>%
-  pivot_longer(cols = -all_of(coord_cols),
-               names_to = "Species",
-               values_to = "Value")
+  pivot_longer(
+    cols = -all_of(coord_cols),
+    names_to = "Species",
+    values_to = "Value"
+  )
 
 for (sc_name in names(scenarios)) {
 
   env_all <- scenarios[[sc_name]]
 
-  # ---- output folders ----
-  sc_out <- file.path(OUT_ROOT, paste0(sc_name, "_", RES_TAG))
+  sc_out <- file.path(OUT_ROOT, sc_name)
   dir.create(sc_out, recursive = TRUE, showWarnings = FALSE)
   dir.create(file.path(sc_out, "model"), recursive = TRUE, showWarnings = FALSE)
   dir.create(file.path(sc_out, "prediction"), recursive = TRUE, showWarnings = FALSE)
@@ -90,13 +74,24 @@ for (sc_name in names(scenarios)) {
   dir.create(file.path(sc_out, "threshold"), recursive = TRUE, showWarnings = FALSE)
   dir.create(file.path(sc_out, "variable_importance"), recursive = TRUE, showWarnings = FALSE)
 
-  ths <- data.frame(Scenario=character(), Species=character(),
-                    matrix(ncol=15, nrow=0), Max_Value=numeric(), stringsAsFactors = FALSE)
+  ths <- data.frame(
+    Scenario = character(),
+    Species  = character(),
+    matrix(ncol = 15, nrow = 0),
+    Max_Value = numeric(),
+    stringsAsFactors = FALSE
+  )
   colnames(ths)[3:17] <- paste0("T", 1:15)
 
-  var <- data.frame(Scenario=character(), Species=character(),
-                    variables=character(), corTest=numeric(), lower=numeric(), upper=numeric(),
-                    stringsAsFactors = FALSE)
+  var <- data.frame(
+    Scenario = character(),
+    Species  = character(),
+    variables = character(),
+    corTest = numeric(),
+    lower = numeric(),
+    upper = numeric(),
+    stringsAsFactors = FALSE
+  )
 
   counter <- 1
 
@@ -116,7 +111,7 @@ for (sc_name in names(scenarios)) {
     pts_ll <- project(pts_ll, crs(env_all))
 
     X <- terra::extract(env_all, pts_ll)
-    X <- data.frame(X[,-1])
+    X <- data.frame(X[, -1])
     if (ncol(X) < 2) { counter <- counter + 1; next }
 
     set.seed(123)
@@ -152,27 +147,27 @@ for (sc_name in names(scenarios)) {
     pres_df <- sp_dat %>% filter(species > 0)
     if (nrow(pres_df) < 10) { counter <- counter + 1; next }
 
-    pres_pts <- vect(pres_df, geom = c("longitude","latitude"), crs="EPSG:4326")
+    pres_pts <- vect(pres_df, geom = c("longitude", "latitude"), crs = "EPSG:4326")
     pres_pts <- project(pres_pts, crs(env_sel))
 
     spx <- terra::extract(env_sel, pres_pts)
-    spx <- data.frame(spx[,-1])
+    spx <- data.frame(spx[, -1])
     if (ncol(spx) < 2) { counter <- counter + 1; next }
 
-    # ---- correlation filter ----
     cor_mat <- cor(spx, use = "pairwise.complete.obs")
     high_cor <- findCorrelation(cor_mat, cutoff = 0.7, names = TRUE, exact = TRUE)
     env_cor <- env_sel[[setdiff(names(env_sel), high_cor)]]
 
-    # ---- VIF filter (apply to env_cor and keep the result; do not overwrite) ----
     v <- vifstep(env_cor)
     env_final <- exclude(env_cor, v)
 
     d <- sdmData(species ~ ., train = pres_pts, predictors = env_final, bg = list(n = 2000))
 
-    m <- sdm(species ~ ., d,
-             methods = c('svm', 'maxent', "rf", "brt", "glmpoly"),
-             replication = 'sub', test.p = 30, n = 5)
+    m <- sdm(
+      species ~ ., d,
+      methods = c("svm", "maxent", "rf", "brt", "glmpoly"),
+      replication = "sub", test.p = 30, n = 5
+    )
 
     pred_path  <- file.path(sc_out, "prediction", paste0("prediction_", sp_name, ".tif"))
     ens_path   <- file.path(sc_out, "ensemble",   paste0("ensemble_",   sp_name, ".tif"))
@@ -180,10 +175,12 @@ for (sc_name in names(scenarios)) {
 
     prediction <- predict(m, env_final, filename = pred_path, overwrite = TRUE)
 
-    en <- sdm::ensemble(m, prediction,
-                        filename = ens_path,
-                        setting = list(method = 'weighted', stat = 'AUC'),
-                        overwrite = TRUE)
+    en <- sdm::ensemble(
+      m, prediction,
+      filename = ens_path,
+      setting = list(method = "weighted", stat = "AUC"),
+      overwrite = TRUE
+    )
 
     th <- tryCatch(evaluates(m@data, en), error = function(e) NULL)
     th_values <- rep(NA_real_, 15)
@@ -192,22 +189,23 @@ for (sc_name in names(scenarios)) {
       th_values[1:min(15, length(thr))] <- thr[1:min(15, length(thr))]
     }
 
-    mx <- global(en, 'max', na.rm = TRUE)[1, 1]
-    th_data <- data.frame(Scenario=sc_name, Species=sp_name, t(th_values), Max_Value=mx, check.names=FALSE)
-    colnames(th_data)[3:17] <- paste0("T",1:15)
+    mx <- global(en, "max", na.rm = TRUE)[1, 1]
+    th_data <- data.frame(Scenario = sc_name, Species = sp_name, t(th_values), Max_Value = mx, check.names = FALSE)
+    colnames(th_data)[3:17] <- paste0("T", 1:15)
     ths <- rbind(ths, th_data)
 
     saveRDS(m, file = model_path)
 
     z <- getVarImp(m)
     vi <- z@varImportanceMean$corTest
+
     var_data <- data.frame(
       Scenario = sc_name,
-      Species = sp_name,
+      Species  = sp_name,
       variables = vi[["variables"]],
       corTest = vi[["corTest"]],
-      lower = vi[["lower"]],
-      upper = vi[["upper"]]
+      lower   = vi[["lower"]],
+      upper   = vi[["upper"]]
     )
     var <- rbind(var, var_data)
 
@@ -217,11 +215,15 @@ for (sc_name in names(scenarios)) {
     counter <- counter + 1
   }
 
-  write.csv(ths, file.path(sc_out, "threshold",
-                           paste0("thresholds_all_species_", sc_name, "_", RES_TAG, ".csv")),
-            row.names = FALSE)
+  write.csv(
+    ths,
+    file.path(sc_out, "threshold", paste0("thresholds_all_species_", sc_name, ".csv")),
+    row.names = FALSE
+  )
 
-  write.csv(var, file.path(sc_out, "variable_importance",
-                           paste0("importance_variable_all_species_", sc_name, "_", RES_TAG, ".csv")),
-            row.names = FALSE)
+  write.csv(
+    var,
+    file.path(sc_out, "variable_importance", paste0("importance_variable_all_species_", sc_name, ".csv")),
+    row.names = FALSE
+  )
 }
