@@ -14,7 +14,7 @@ north_shp <- "data/boundary/north.shp"
 out_dir <- "outputs/interpolation"
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-res_list <- 500
+res_list <- 1000
 
 p_power    <- 2
 maxdist_m  <- 7000
@@ -101,12 +101,12 @@ for (v in vars) {
   if (!is.null(res_obj$raster)) {
     writeRaster(
       res_obj$raster,
-      file.path(out_dir, paste0("idw_", v, "_500m.tif")),
+      file.path(out_dir, paste0("idw_", v, "_1000m.tif")),
       overwrite = TRUE
     )
   }
 }
 
 rmse_table <- bind_rows(stats_all)
-fwrite(rmse_table, file.path(out_dir, "rmse_summary_500m.csv"))
+fwrite(rmse_table, file.path(out_dir, "rmse_summary_1000m.csv"))
 rmse_table
