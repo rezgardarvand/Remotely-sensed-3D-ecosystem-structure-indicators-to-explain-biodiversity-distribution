@@ -9,10 +9,10 @@ library(data.table)
 
 data_csv <- "data/processed/Cupressus_final_data_for_SDM.csv"
 
-GEDI_DIR  <- "data/predictors/GEDI_500m"
+GEDI_DIR  <- "data/predictors/GEDI_1km"
 CHELSA_DIR <- "data/predictors/CHELSA_1km"
 
-OUT_ROOT <- "outputs/sdm_500m"
+OUT_ROOT <- "outputs/sdm_1km"
 dir.create(OUT_ROOT, recursive = TRUE, showWarnings = FALSE)
 
 data <- fread(data_csv, check.names = FALSE)
